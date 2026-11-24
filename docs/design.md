@@ -284,7 +284,8 @@ SetRepository       polkit      allowed repo name + enabled flag
 
 Validation before anything is passed to pacman:
 
-- names must match an exact sync or local package name;
+- names must match an exact sync or local package name, or an exact group name
+  in an enabled repository;
 - ASCII `[a-z0-9@._+-]`, at most 128 characters, no `/`, whitespace, glob, or
   leading `-`;
 - at most 64 names per request;
@@ -305,10 +306,10 @@ Validation before anything is passed to pacman:
 5. Remove is `pacman -Rns --noconfirm <pkgs>`, and only after the preview lists
    the full removal closure, including dependencies that become unneeded. No
    orphan removal happens unless the user explicitly confirmed that list.
-6. Groups are expanded in the UI. The user can deselect members; the helper
-   receives member names, so pacman never pulls a deselected member. The
-   tradeoff is that packages are recorded as explicit installs instead of the
-   group being recorded.
+6. Group targets are accepted by name. The helper resolves the group with
+   libalpm for the preview, then pacman installs the group itself, so the
+   transaction matches pacman exactly. Member deselection is a follow-up; v1
+   installs the whole group.
 7. Provider and virtual-package choices are explicit. The helper never guesses.
 8. Optional dependencies are shown but never installed automatically. Each one
    can be added to the request as a normal package.

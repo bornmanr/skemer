@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatBytes, sourceLabel } from "./types";
+import { formatBytes, packageActionLabel, sourceLabel } from "./types";
 
 describe("formatBytes", () => {
   it("formats zero and small values", () => {
@@ -24,5 +24,12 @@ describe("sourceLabel", () => {
     expect(sourceLabel("system")).toBe("System");
     expect(sourceLabel("flatpak-system")).toBe("Flatpak system");
     expect(sourceLabel("flatpak-user")).toBe("Flatpak user");
+  });
+});
+
+describe("packageActionLabel", () => {
+  it("labels package actions", () => {
+    expect(packageActionLabel("install")).toBe("Install");
+    expect(packageActionLabel("remove")).toBe("Remove");
   });
 });

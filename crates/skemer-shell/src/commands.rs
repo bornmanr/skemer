@@ -1,6 +1,10 @@
 use std::str::FromStr;
 
-use skemer_core::models::{ApplyOutcome, ApplyRequest, HoldDecision, UpdatePlan, UpdateSource};
+use skemer_core::models::{
+    ApplyOutcome, ApplyRequest, HoldDecision, PackageAction, PackageDetails, PackageHit,
+    PackageOutcome, PackagePreview, PackageQuery, PackageRequest, RepositoryStatus, UpdatePlan,
+    UpdateSource,
+};
 use skemer_core::Settings;
 use tauri::Manager;
 
@@ -88,6 +92,75 @@ pub async fn cancel_updates() -> Result<(), String> {
     // The helper may not have a running job; cancel is still a no-op then.
     let _ = helper::cancel().await;
     Ok(())
+}
+
+#[tauri::command]
+pub async fn search_packages(
+    query: String,
+    repo: Option<String>,
+    installed_only: bool,
+) -> Result<Vec<PackageHit>, String> {
+    helper::search_packages(PackageQuery {
+        query,
+        repo,
+        installed_only,
+        limit: 50,
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn package_info(name: String) -> Result<PackageDetails, String> {
+    helper::package_info(name)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn preview_packages(
+    action: String,
+    names: Vec<String>,
+) -> Result<PackagePreview, String> {
+    let action = PackageAction::from_str(&action)?;
+    helper::preview_packages(PackageRequest { action, names })
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn apply_packages(
+    app: tauri::AppHandle,
+    action: String,
+    names: Vec<String>,
+) -> Result<PackageOutcome, String> {
+    let action = PackageAction::from_str(&action)?;
+    let result = helper::apply_packages(app, PackageRequest { action, names })
+        .await
+        .map_err(|error| error.to_string());
+    crate::state::signal_parent(libc::SIGUSR1);
+    result
+}
+
+#[tauri::command]
+pub async fn repository_status() -> Result<RepositoryStatus, String> {
+    helper::repository_status()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn set_repository(name: String, enabled: bool) -> Result<RepositoryStatus, String> {
+    helper::set_repository(name, enabled)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn set_pacman_option(name: String, value: String) -> Result<RepositoryStatus, String> {
+    helper::set_pacman_option(name, value)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]

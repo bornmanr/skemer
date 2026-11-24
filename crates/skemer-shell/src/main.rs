@@ -31,6 +31,13 @@ fn main() {
             commands::prepare_holds,
             commands::apply_updates,
             commands::cancel_updates,
+            commands::search_packages,
+            commands::package_info,
+            commands::preview_packages,
+            commands::apply_packages,
+            commands::repository_status,
+            commands::set_repository,
+            commands::set_pacman_option,
             commands::load_settings,
             commands::save_settings,
         ]);

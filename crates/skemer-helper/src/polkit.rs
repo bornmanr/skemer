@@ -5,6 +5,8 @@ use zbus::zvariant::Value;
 use zbus::Connection;
 
 pub const APPLY_ACTION: &str = "org.veldmuislinux.skemer.apply";
+pub const MANAGE_PACKAGES_ACTION: &str = "org.veldmuislinux.skemer.manage-packages";
+pub const MANAGE_REPOSITORIES_ACTION: &str = "org.veldmuislinux.skemer.manage-repositories";
 
 const AUTHORITY: &str = "org.freedesktop.PolicyKit1";
 const AUTHORITY_PATH: &str = "/org/freedesktop/PolicyKit1/Authority";
