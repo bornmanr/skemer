@@ -178,6 +178,9 @@ and suggests starting `skemer-helper`.
 
 - Separate repository: `Skemer`.
 - Separate Skemer release key; signed tarball; Veldmuis pin; release watcher.
+- Daily patch release from `main` when it has changed, at 12:00
+  Africa/Johannesburg; deliberate minor or major bumps still use the manual tag
+  path.
 - `veldmuis-skemer` packages the signed tarball like `veldmuis-muis`.
 - libalpm ABI: the package depends on the exact `libalpm.so` soname. Skemer and
   libalpm upgrade atomically in `pacman -Syu`. An ABI watcher forces a new
