@@ -83,6 +83,9 @@ signs before it writes the zip.
 
 ## Cut a release
 
+Patch releases are cut automatically; see [Daily releases](#daily-releases).
+Use this manual path for a deliberate minor or major bump.
+
 1. Bump the version in `crates/skemer-shell/tauri.conf.json` and keep the
    workspace version in `Cargo.toml` in step.
 2. Merge the version bump to `main` and confirm `packaging/keys/` is present.
@@ -106,6 +109,31 @@ signs before it writes the zip.
 
 `workflow_dispatch` runs the build jobs without publishing; only a `v*` tag
 creates a release.
+
+## Daily releases
+
+`Daily Release` runs at 12:00 Africa/Johannesburg (10:00 UTC) and can also be
+dispatched manually from `main`.
+
+- If `main` has no commits since the latest `vX.Y.Z` release, it exits without
+  doing anything.
+- If the latest tag has no published release, it retries that release before
+  bumping anything.
+- Otherwise it bumps the patch version, or uses a higher version already
+  declared in `tauri.conf.json` for a deliberate minor or major bump.
+- It updates `Cargo.toml`, `Cargo.lock`, `tauri.conf.json`, and the frontend
+  package files, commits `chore: release X.Y.Z`, pushes `main`, tags `vX.Y.Z`,
+  and calls the reusable `release` workflow for that commit.
+- The tag push uses `GITHUB_TOKEN`, which does not start another workflow run,
+  so the daily workflow calls `release` directly instead of relying on the tag
+  trigger. Manual tags still trigger `release` normally.
+
+The bot commits to `main`. If branch protection is added, allow the Actions bot
+to push, or change the workflow to open a bump pull request. The daily commit
+does not trigger CI; the release build is its verification gate.
+
+To cut the next release immediately, merge any pending changes and run
+**Actions → Daily Release → Run workflow** from `main`.
 
 ## Verify a release
 

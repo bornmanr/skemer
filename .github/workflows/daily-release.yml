@@ -1,0 +1,167 @@
+name: Daily Release
+
+on:
+  schedule:
+    # 12:00 Africa/Johannesburg. South Africa is UTC+2 year-round; GitHub cron
+    # uses UTC.
+    - cron: "0 10 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: skemer-daily-release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Prepare the next release
+    if: github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      skip: ${{ steps.version.outputs.skip }}
+      tag: ${{ steps.version.outputs.tag }}
+      ref: ${{ steps.version.outputs.ref }}
+    steps:
+      - name: Check out main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: refs/heads/main
+
+      - name: Bump the version when main has changed
+        id: version
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          git fetch --force --tags origin '+refs/heads/main:refs/remotes/origin/main'
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          head="$(git rev-parse HEAD)"
+          latest_tag="$(git tag --list 'v*' --sort=-v:refname \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+            | head -n 1 || true)"
+          echo "Main ${head}; latest release tag ${latest_tag:-none}"
+
+          if [[ -n "${latest_tag}" ]]; then
+            tag_commit="$(git rev-list -n 1 "${latest_tag}")"
+            if [[ "${head}" == "${tag_commit}" ]]; then
+              if gh release view "${latest_tag}" >/dev/null 2>&1; then
+                echo "No commits since ${latest_tag}; nothing to release."
+                echo "skip=true" >> "${GITHUB_OUTPUT}"
+                exit 0
+              fi
+              echo "Retrying the missing release for ${latest_tag}."
+              echo "tag=${latest_tag}" >> "${GITHUB_OUTPUT}"
+              echo "ref=${head}" >> "${GITHUB_OUTPUT}"
+              exit 0
+            fi
+          fi
+
+          source="$(python3 -c "import json;print(json.load(open('crates/skemer-shell/tauri.conf.json'))['version'])")"
+          version="$(python3 - "${latest_tag#v}" "${source}" <<'PY'
+          import sys
+
+          latest = sys.argv[1]
+          source = sys.argv[2]
+
+          def parse(value):
+              return tuple(int(part) for part in value.split('.'))
+
+          if not latest:
+              print(source)
+          else:
+              current = parse(latest)
+              declared = parse(source)
+              if declared > current:
+                  print(source)
+              else:
+                  print(f"{current[0]}.{current[1]}.{current[2] + 1}")
+          PY
+          )"
+          tag="v${version}"
+          echo "Preparing ${tag}."
+
+          if git rev-parse --verify "refs/tags/${tag}" >/dev/null 2>&1; then
+            echo "The tag ${tag} already exists; refusing to reuse it." >&2
+            exit 1
+          fi
+
+          python3 - "${version}" <<'PY'
+          import json
+          import pathlib
+          import re
+          import sys
+
+          version = sys.argv[1]
+          root = pathlib.Path(".")
+
+          cargo = root / "Cargo.toml"
+          text, count = re.subn(
+              r'(?m)^version = "[^"]+"', f'version = "{version}"', cargo.read_text(), count=1
+          )
+          if count != 1:
+              raise SystemExit("could not update Cargo.toml")
+          cargo.write_text(text)
+
+          lock_path = root / "Cargo.lock"
+          lock = lock_path.read_text()
+          for name in ("skemer-core", "skemer-helper", "skemer-shell"):
+              lock, count = re.subn(
+                  rf'(name = "{name}"\nversion = ")[^"]+"', rf'\g<1>{version}"', lock
+              )
+              if count != 1:
+                  raise SystemExit(f"could not update {name} in Cargo.lock")
+          lock_path.write_text(lock)
+
+          tauri_path = root / "crates/skemer-shell/tauri.conf.json"
+          tauri = json.loads(tauri_path.read_text())
+          tauri["version"] = version
+          tauri_path.write_text(json.dumps(tauri, indent=2) + "\n")
+
+          package_path = root / "src-ui/package.json"
+          package = json.loads(package_path.read_text())
+          package["version"] = version
+          package_path.write_text(json.dumps(package, indent=2) + "\n")
+
+          package_lock_path = root / "src-ui/package-lock.json"
+          package_lock = json.loads(package_lock_path.read_text())
+          package_lock["version"] = version
+          package_lock.setdefault("packages", {}).setdefault("", {})["version"] = version
+          package_lock_path.write_text(json.dumps(package_lock, indent=2) + "\n")
+          PY
+
+          git add \
+            Cargo.toml Cargo.lock \
+            crates/skemer-shell/tauri.conf.json \
+            src-ui/package.json src-ui/package-lock.json
+
+          if git diff --cached --quiet; then
+            echo "The version files already say ${version}; tagging this commit."
+          else
+            git commit -m "chore: release ${version}"
+          fi
+
+          release_ref="$(git rev-parse HEAD)"
+          git tag -a "${tag}" -m "Skemer ${version}"
+          git push origin HEAD:main
+          git push origin "${tag}"
+
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "ref=${release_ref}" >> "${GITHUB_OUTPUT}"
+
+  publish:
+    name: Publish the signed release
+    needs: prepare
+    if: needs.prepare.outputs.skip != 'true'
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.prepare.outputs.tag }}
+      ref: ${{ needs.prepare.outputs.ref }}
