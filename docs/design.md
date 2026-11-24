@@ -15,15 +15,13 @@ The first release covers:
 
 - the host system (`pacman -Syu`);
 - Flatpak system updates;
-- Flatpak user updates.
+- Flatpak user updates;
+- installing and removing official packages, with repository settings
+  (multilib for Steam).
 
 AUR is deliberately deferred. It will be a separate, user-run source with a
-PTY-backed worker and a persistent user-supported warning.
-
-Installing and removing packages from the official repositories, plus the
-repository settings needed to make that useful (multilib for Steam), is a
-planned follow-up. See §13 and §14. It is not part of the first release and
-does not change the update path.
+PTY-backed worker and a persistent user-supported warning. See §13 and §14 for
+package management.
 
 ## 2. Product Behavior
 
@@ -207,8 +205,8 @@ and suggests starting `skemer-helper`.
 6. Packaging and release: Veldmuis package, keyring, release watcher, ABI
    watcher.
 7. AUR: deferred follow-up.
-8. Package management (planned, §13): official-repository search, install,
-   remove, transaction preview, and repository settings (multilib).
+8. Package management (§13): official-repository search, install, remove,
+   transaction preview, and repository settings (multilib).
 
 ## 12. Open Implementation Details
 
@@ -224,11 +222,10 @@ and suggests starting `skemer-helper`.
 - Package dependency list for `veldmuis-skemer`.
 - Release watcher and ABI watcher workflow.
 
-## 13. Package Management (Planned)
+## 13. Package Management
 
-Status: design for the release after v1. Not implemented yet. Nothing in §1–§12
-changes; this reuses the helper, the transaction lock, and the polkit style but
-adds no new update behavior.
+Status: implemented. It reuses the helper, the transaction lock, and the polkit
+style but adds no new update behavior.
 
 ### 13.1 Why Skemer and not PackageKit/Discover
 
@@ -347,7 +344,7 @@ The helper opens a fresh libalpm handle per request, so a system update or a
 repository change is visible to the next search. A missing `<repo>.db` produces
 a warning on that repository rather than an empty result set.
 
-## 14. Repository And Pacman Settings (Planned)
+## 14. Repository And Pacman Settings
 
 ### 14.1 Effective Configuration And Provenance
 

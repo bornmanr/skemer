@@ -1,7 +1,8 @@
 # Skemer
 
 Skemer is the updater for Veldmuis: a small tray application that reviews and
-applies system and Flatpak updates, with a Veldmuis profile and theme.
+applies system and Flatpak updates, and browses the official repositories to
+install or remove packages, with a Veldmuis profile and theme.
 
 The name is Afrikaans for dusk. The app is not tied to one package manager;
 the first release covers the host system and Flatpak, with AUR planned as a
@@ -10,11 +11,11 @@ separate, user-run source.
 ## Status
 
 The scaffold, the system and Flatpak sources, the streaming apply path, the tray
-lifecycle, and the signed release pipeline are in place. The tray process owns
-periodic checks, notifications, and autostart; the window runs in a short-lived
-`skemer --window` child so closing it releases WebKitGTK. The design is in
-[`docs/design.md`](docs/design.md), the release process in
-[`docs/release.md`](docs/release.md), and the UI reference is
+lifecycle, the signed release pipeline, and package browsing with repository
+settings are in place. The tray process owns periodic checks, notifications, and
+autostart; the window runs in a short-lived `skemer --window` child so closing it
+releases WebKitGTK. The design is in [`docs/design.md`](docs/design.md), the
+release process in [`docs/release.md`](docs/release.md), and the UI reference is
 [`docs/mockup.html`](docs/mockup.html).
 
 ## Shape
