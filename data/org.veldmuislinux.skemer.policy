@@ -27,4 +27,26 @@
       <allow_active>auth_admin_keep</allow_active>
     </defaults>
   </action>
+
+  <action id="org.veldmuislinux.skemer.manage-packages">
+    <description>Install or remove packages</description>
+    <message>Authentication is required to change installed packages</message>
+    <icon_name>skemer</icon_name>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
+  <action id="org.veldmuislinux.skemer.manage-repositories">
+    <description>Change package repositories and pacman options</description>
+    <message>Authentication is required to change repository settings</message>
+    <icon_name>skemer</icon_name>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
 </policyconfig>

@@ -15,10 +15,13 @@ The first release covers:
 
 - the host system (`pacman -Syu`);
 - Flatpak system updates;
-- Flatpak user updates.
+- Flatpak user updates;
+- installing and removing official packages, with repository settings
+  (multilib for Steam).
 
 AUR is deliberately deferred. It will be a separate, user-run source with a
-PTY-backed worker and a persistent user-supported warning.
+PTY-backed worker and a persistent user-supported warning. See §13 and §14 for
+package management.
 
 ## 2. Product Behavior
 
@@ -76,7 +79,10 @@ skemer --tray (user)
             ├─ libalpm check/prepare
             ├─ pacman -Syu
             ├─ flatpak system update
-            └─ veldmuis-refresh-arch-mirrors / reflector
+            ├─ veldmuis-refresh-arch-mirrors / reflector
+            ├─ pacman -Syu --needed <pkgs>   (planned, §13)
+            ├─ pacman -Rns <pkgs>            (planned, §13)
+            └─ managed pacman.conf writes    (planned, §14)
 ```
 
 - The GUI never runs as root.
@@ -138,6 +144,9 @@ reboot.
 - D-Bus: `org.veldmuislinux.skemer`
 - Polkit: `org.veldmuislinux.skemer.apply`
 - Helper: `skemer-helper`
+- Polkit for package management (planned):
+  `org.veldmuislinux.skemer.manage-packages` and
+  `org.veldmuislinux.skemer.manage-repositories`
 
 The core is distro-agnostic. A `DistroProfile` selects:
 
@@ -196,6 +205,8 @@ and suggests starting `skemer-helper`.
 6. Packaging and release: Veldmuis package, keyring, release watcher, ABI
    watcher.
 7. AUR: deferred follow-up.
+8. Package management (§13): official-repository search, install, remove,
+   transaction preview, and repository settings (multilib).
 
 ## 12. Open Implementation Details
 
@@ -210,3 +221,239 @@ and suggests starting `skemer-helper`.
 - Tray menu copy and icon states.
 - Package dependency list for `veldmuis-skemer`.
 - Release watcher and ABI watcher workflow.
+
+## 13. Package Management
+
+Status: implemented. It reuses the helper, the transaction lock, and the polkit
+style but adds no new update behavior.
+
+### 13.1 Why Skemer and not PackageKit/Discover
+
+Veldmuis ships Plasma without Discover or PackageKit, so a fresh install has no
+graphical way to add software. The two options are:
+
+- ship `discover` + `packagekit`, which is nearly free but introduces a second
+  transaction path layered over pacman and splits updates across two apps;
+- extend Skemer, which already has libalpm, the root helper, polkit, the
+  single-transaction lock, and streamed logs.
+
+Skemer is the better owner: one privileged surface, the same hooks, the same
+ignore/hold semantics, and one branded app. Search stays local; the only
+network access is pacman's own database sync.
+
+### 13.2 Scope
+
+- Search the enabled sync databases (core, extra, multilib, and the Veldmuis
+  repositories). On a current Veldmuis install that is about 15,800 packages.
+- Install and remove official packages only.
+- `openai-codex` is `extra/openai-codex`; Steam is `multilib/steam`.
+- No AUR, no Flatpak app discovery, no downgrades, no testing repositories, no
+  custom repositories, no screenshots, ratings, or categories.
+- Search-first. There is no curated home page or featured list.
+
+### 13.3 Helper API
+
+Read-only calls are allowed for active local users. Writes require polkit.
+Every call takes JSON, returns JSON, and is a fixed method; the client never
+passes flags, paths, or shell text.
+
+```text
+SearchPackages      read-only   query, optional repo, installed-only, limit
+PackageInfo         read-only   one exact package name
+PreviewPackages     read-only   action + names, validates with libalpm
+ApplyPackages       polkit      action + names, streams Progress and LogLine
+RepositoryStatus    read-only   effective repositories and provenance
+SetRepository       polkit      allowed repo name + enabled flag
+```
+
+- `SearchPackages` returns name, repo, version, installed version (or none),
+  download and installed size, summary, and groups. Default limit 50, maximum
+  100. No pagination in v1.
+- `PackageInfo` returns depends, optional depends, conflicts, replaces,
+  provides, groups, licenses, URL, packager, build date, and, when installed,
+  the reverse dependencies from the local database.
+- `PreviewPackages` runs a libalpm transaction with the requested packages and
+  returns `adds`, `removes`, `total_download_bytes`,
+  `total_installed_bytes`, `pending_system_updates`, `reboot_suggested`, and
+  `warnings`. This is the same read-only preparation pattern as `Prepare`.
+- `ApplyPackages` uses the update transaction lock. `Cancel` from the user that
+  started it sends SIGINT to the process group, exactly as it does for updates.
+
+Validation before anything is passed to pacman:
+
+- names must match an exact sync or local package name, or an exact group name
+  in an enabled repository;
+- ASCII `[a-z0-9@._+-]`, at most 128 characters, no `/`, whitespace, glob, or
+  leading `-`;
+- at most 64 names per request;
+- a name that resolves to several providers is rejected unless the UI sent the
+  concrete provider name.
+
+### 13.4 Transaction Rules
+
+1. Install is one transaction: `pacman -Syu --needed --noconfirm <pkgs>` with
+   `LC_ALL=C` and `--color never`. Never a bare `pacman -S`.
+2. Folding the full sync in is deliberate. Installing from an unsynced or stale
+   setup is the classic partial upgrade; `-Syu` makes the install atomic with
+   the rest of the system. The confirmation sheet shows how many pending updates
+   and how much download the install drags in.
+3. `--needed` avoids reinstalling packages that are already current.
+4. Replacements reported by libalpm appear in the preview and are applied by
+   `-Syu`; they are never silent.
+5. Remove is `pacman -Rns --noconfirm <pkgs>`, and only after the preview lists
+   the full removal closure, including dependencies that become unneeded. No
+   orphan removal happens unless the user explicitly confirmed that list.
+6. Group targets are accepted by name. The helper resolves the group with
+   libalpm for the preview, then pacman installs the group itself, so the
+   transaction matches pacman exactly. Member deselection is a follow-up; v1
+   installs the whole group.
+7. Provider and virtual-package choices are explicit. The helper never guesses.
+8. Optional dependencies are shown but never installed automatically. Each one
+   can be added to the request as a normal package.
+9. One transaction at a time, shared with updates. A failing install returns the
+   error and the log tail; there is no hold-and-retry loop on installs.
+10. Reboot rules from §6 apply after a successful install or removal.
+
+Refresh of the databases is not exposed as its own action. `-Sy` alone is only
+safe because Skemer never installs with `-S`; the install transaction always
+does the full sync.
+
+### 13.5 UI
+
+- A top-level switch `Updates | Browse` above the existing source tabs. The
+  `System` and `Flatpak` tabs and their counts stay inside `Updates`; `Browse`
+  has no counts and no update state.
+- Search box with a short debounce. Results show name, repository chip (the
+  existing `multilib` chip style), version, and an installed marker. Ranking is
+  exact name, then prefix, then token/substring, then alphabetical. Installed
+  packages remain searchable.
+- Detail pane follows the existing two-pane layout: metadata, description,
+  dependencies, optional dependencies, conflicts/replaces, and reverse
+  dependencies when installed.
+- Primary action is `Install`, `Remove`, or a disabled `Installed`.
+- Confirmation sheet before polkit: adds, removes, download size, disk delta,
+  pending updates folded into the transaction, replacement warnings, and the
+  reboot note. Then the existing progress and log view.
+- Empty state: “Search the official repositories.” with one line stating that
+  AUR and Flatpak apps are not available here.
+- No results: “Not in the official repositories.” plus the query as typed.
+
+### 13.6 Data Freshness
+
+The helper opens a fresh libalpm handle per request, so a system update or a
+repository change is visible to the next search. A missing `<repo>.db` produces
+a warning on that repository rather than an empty result set.
+
+## 14. Repository And Pacman Settings
+
+### 14.1 Effective Configuration And Provenance
+
+`RepositoryStatus` reads `/etc/pacman.conf` and each `Include` file in order and
+reports, per repository: name, enabled state, defining file, signature level,
+mirror source, package count, and the sync database modification time. The
+effective values come from libalpm/pacman; the file and line come from parsing,
+because Skemer must never edit a file it cannot safely own.
+
+Distro facts that matter:
+
+- Veldmuis already enables multilib in `/etc/pacman.conf.d/veldmuis.conf`,
+  which is owned by `veldmuis-release` and included from `/etc/pacman.conf`.
+  `multilib/steam` is therefore available out of the box on a current Veldmuis
+  image; the toggle exists for generic Arch and for older or modified systems
+  where the block is commented out.
+- That file is package-owned. Skemer must not edit it, because a package update
+  would silently overwrite the change. When multilib comes from it, the UI says
+  “Enabled, managed by Veldmuis” and offers no disable switch.
+- `core`, `extra`, and the Veldmuis repositories are never disabled from Skemer.
+
+The Settings window gains a `System` section with the repository rows, the
+multilib action, `ParallelDownloads`, and mirror refresh. The existing interval,
+notification, autostart, and tray options stay in the app section.
+
+### 14.2 Enable Multilib
+
+- Already enabled anywhere: show enabled, no write.
+- Disabled with a commented `#[multilib]` block in `/etc/pacman.conf`: uncomment
+  that block in place. This is the canonical Arch location and survives pacman
+  upgrades through the normal config-file handling.
+- Disabled with no block: append the canonical `[multilib]` plus
+  `Include = /etc/pacman.d/mirrorlist` block to `/etc/pacman.conf`, in the
+  repository section, before the Veldmuis include.
+- Never edit `veldmuis.conf` or any other include. Never add a second section
+  when a commented one exists.
+- Write atomically with the original mode preserved, a timestamped backup under
+  `/var/lib/skemer/backups/`, and a rollback if validation fails.
+- Validate the new file with `pacman-conf --config <candidate>`, then sync the
+  databases. A sync failure restores the backup and reports the pacman error.
+- Enabling multilib downloads thousands of 32-bit package entries; the UI
+  states that before applying.
+- Disabling a repository keeps installed packages installed but stops their
+  updates. The sheet lists the installed packages that would be affected and
+  requires explicit confirmation. On Veldmuis this path is not offered for
+  multilib.
+
+### 14.3 Pacman Options
+
+Deliberately minimal in v1:
+
+- `ParallelDownloads` (1–10) in `/etc/pacman.conf`, validated and backed up like
+  the repository write. If the effective value comes from an include rather than
+  `/etc/pacman.conf`, the row is read-only and names the owning file.
+- Mirror refresh reuses the existing `RefreshMirrors` action and polkit action.
+- Not offered: `SigLevel`, `IgnorePkg`, `IgnoreGroup`, testing repositories,
+  custom repositories, `Server` entries, or any include-file editing. Holds stay
+  per-transaction (§5) and are never persisted.
+
+### 14.4 Maintenance (Later)
+
+Package cache size and safe `pacman -Sc` cleanup, an explicit orphan list with
+confirmed removal, and access to failed-transaction logs. All of these are later
+than the install tab and none of them run automatically.
+
+### 14.5 Privileges
+
+- `SearchPackages`, `PackageInfo`, `PreviewPackages`, and `RepositoryStatus`:
+  allowed for active local users, read-only, no polkit prompt.
+- `ApplyPackages`: `org.veldmuislinux.skemer.manage-packages`, `auth_admin_keep`.
+- `SetRepository` and the option write: separate
+  `org.veldmuislinux.skemer.manage-repositories`, `auth_admin_keep`, so a policy
+  can allow updates without allowing configuration changes.
+- The helper writes only allowlisted paths. No request field ever names a path.
+- A repository change and an install are separate transactions and separate
+  authorizations.
+
+### 14.6 Failure And Safety Rules
+
+- No shell interpolation, no globs, no client-supplied flags.
+- Requests are bounded; previews and searches are capped.
+- Every config write is backup, atomic replace, validate, then rollback on error.
+- A pending `.pacnew` for `pacman.conf` is surfaced as “configuration changes
+  pending” and blocks Skemer writes rather than clobbering the file.
+- A repository write that would leave no enabled repository, remove `core`, or
+  duplicate an existing section is rejected before the filesystem is touched.
+
+### 14.7 Testing
+
+- Search ranking, name validation, provider rejection, group expansion, and the
+  100-result cap.
+- Preview closure for install and remove, including dependencies that become
+  unneeded.
+- Fake `pacman` assertions: installs always pass `-Syu --needed` and never `-S`,
+  removals pass `-Rns` with only the previewed names, and cancellation reaches
+  the process group.
+- Repository parser provenance: enabled, commented, missing, and
+  package-owned-include cases.
+- Multilib enable: commented block, missing block, already enabled, duplicate
+  avoidance, failed sync rollback, and `.pacnew` blocking.
+- Playwright: enable multilib, search `steam`, preview, install, progress, and
+  the read-only Veldmuis multilib state.
+- One VM gate on generic Arch with multilib off (enable, then install Steam) and
+  on a Veldmuis image (multilib already enabled, no toggle), plus a removal
+  closure, a conflict, a group, and a cancel.
+
+### 14.8 Non-Goals
+
+AUR, Flatpak app installation, testing repositories, custom repositories,
+mirror editing, downgrades, partial upgrades, automatic orphan removal, package
+ratings, screenshots, and category browsing.
+

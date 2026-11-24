@@ -147,3 +147,210 @@ impl HoldDecision {
         }
     }
 }
+
+/// Install or remove. Package management never downgrades and never touches
+/// the AUR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PackageAction {
+    Install,
+    Remove,
+}
+
+impl PackageAction {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Install => "Install",
+            Self::Remove => "Remove",
+        }
+    }
+}
+
+impl std::str::FromStr for PackageAction {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "install" => Ok(Self::Install),
+            "remove" => Ok(Self::Remove),
+            other => Err(format!("unknown package action: {other}")),
+        }
+    }
+}
+
+/// Search request from the UI. The helper never accepts flags or paths.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageQuery {
+    #[serde(default)]
+    pub query: String,
+    #[serde(default)]
+    pub repo: Option<String>,
+    #[serde(default)]
+    pub installed_only: bool,
+    #[serde(default = "default_search_limit")]
+    pub limit: usize,
+}
+
+fn default_search_limit() -> usize {
+    50
+}
+
+impl Default for PackageQuery {
+    fn default() -> Self {
+        Self {
+            query: String::new(),
+            repo: None,
+            installed_only: false,
+            limit: default_search_limit(),
+        }
+    }
+}
+
+/// One search result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageHit {
+    pub name: String,
+    pub repo: String,
+    pub version: String,
+    #[serde(default)]
+    pub installed_version: Option<String>,
+    #[serde(default)]
+    pub download_bytes: u64,
+    #[serde(default)]
+    pub installed_bytes: u64,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub groups: Vec<String>,
+}
+
+/// Full metadata for one package.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageDetails {
+    pub name: String,
+    #[serde(default)]
+    pub repo: Option<String>,
+    pub version: String,
+    #[serde(default)]
+    pub installed_version: Option<String>,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub packager: String,
+    #[serde(default)]
+    pub build_date: i64,
+    #[serde(default)]
+    pub download_bytes: u64,
+    #[serde(default)]
+    pub installed_bytes: u64,
+    #[serde(default)]
+    pub licenses: Vec<String>,
+    #[serde(default)]
+    pub groups: Vec<String>,
+    #[serde(default)]
+    pub depends: Vec<String>,
+    #[serde(default)]
+    pub optdepends: Vec<String>,
+    #[serde(default)]
+    pub conflicts: Vec<String>,
+    #[serde(default)]
+    pub replaces: Vec<String>,
+    #[serde(default)]
+    pub provides: Vec<String>,
+    /// Installed packages that depend on this one, read from the local database.
+    #[serde(default)]
+    pub required_by: Vec<String>,
+}
+
+/// One package in a transaction preview.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackagePreviewItem {
+    pub name: String,
+    #[serde(default)]
+    pub repo: Option<String>,
+    pub version: String,
+    #[serde(default)]
+    pub current_version: Option<String>,
+    #[serde(default)]
+    pub download_bytes: u64,
+    #[serde(default)]
+    pub installed_bytes: u64,
+}
+
+/// Read-only resolution of a proposed install or removal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackagePreview {
+    pub action: PackageAction,
+    #[serde(default)]
+    pub adds: Vec<PackagePreviewItem>,
+    #[serde(default)]
+    pub removes: Vec<PackagePreviewItem>,
+    #[serde(default)]
+    pub total_download_bytes: u64,
+    #[serde(default)]
+    pub total_installed_bytes: u64,
+    /// Pending system updates that the install transaction would also apply.
+    #[serde(default)]
+    pub pending_system_updates: usize,
+    #[serde(default)]
+    pub reboot_suggested: bool,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+/// The requested install or removal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageRequest {
+    pub action: PackageAction,
+    pub names: Vec<String>,
+}
+
+/// Result of an install or removal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageOutcome {
+    pub success: bool,
+    #[serde(default)]
+    pub cancelled: bool,
+    pub action: PackageAction,
+    #[serde(default)]
+    pub names: Vec<String>,
+    #[serde(default)]
+    pub reboot_suggested: bool,
+    #[serde(default)]
+    pub log_tail: String,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// One repository as the helper sees it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepositoryInfo {
+    pub name: String,
+    pub enabled: bool,
+    pub source_file: String,
+    #[serde(default)]
+    pub note: Option<String>,
+    #[serde(default)]
+    pub toggleable: bool,
+    #[serde(default)]
+    pub package_count: usize,
+    #[serde(default)]
+    pub synced_at: Option<String>,
+}
+
+/// Effective repository and pacman option state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepositoryStatus {
+    pub pacman_conf: String,
+    pub repositories: Vec<RepositoryInfo>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    #[serde(default)]
+    pub parallel_downloads: u32,
+    #[serde(default)]
+    pub parallel_downloads_editable: bool,
+    #[serde(default)]
+    pub parallel_downloads_source: Option<String>,
+}

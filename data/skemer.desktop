@@ -1,11 +1,11 @@
 [Desktop Entry]
 Type=Application
 Name=Skemer
-GenericName=Software Updater
-Comment=Review and apply system and Flatpak updates
+GenericName=Software Manager
+Comment=Review updates and install packages
 Exec=skemer
 Icon=skemer
 Categories=System;PackageManager;
-Keywords=update;upgrade;pacman;flatpak;skemer;
+Keywords=update;upgrade;install;remove;pacman;flatpak;skemer;
 Terminal=false
 StartupWMClass=skemer

@@ -1,15 +1,18 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Command as StdCommand, Stdio};
 
 use alpm::{Alpm, SigLevel, TransFlag};
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use skemer_core::models::{
-    ApplyOutcome, ApplyRequest, HoldDecision, UpdateItem, UpdatePlan, UpdateSource,
+    ApplyOutcome, ApplyRequest, HoldDecision, PackageAction, PackageDetails, PackageHit,
+    PackageOutcome, PackagePreview, PackagePreviewItem, PackageQuery, PackageRequest,
+    RepositoryInfo, RepositoryStatus, UpdateItem, UpdatePlan, UpdateSource,
 };
 use skemer_core::sources::FlatpakScope;
-use skemer_core::{pacman_conf, plan, CancelHandle};
+use skemer_core::{packages, pacman_conf, pacman_config, plan, CancelHandle};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
 
@@ -634,11 +637,664 @@ fn now() -> String {
     chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
+/// Search enabled sync databases. The first repository that defines a name wins,
+/// matching pacman's own preference order.
+pub fn search(request: &PackageQuery) -> Result<Vec<PackageHit>> {
+    let handle = SystemHandle::open()?;
+    let needle = request.query.trim().to_ascii_lowercase();
+    let limit = packages::clamp_limit(request.limit);
+    let mut hits: HashMap<String, PackageHit> = HashMap::new();
+
+    for database in handle.alpm.syncdbs().iter() {
+        let repo = database.name().to_string();
+        if let Some(filter) = &request.repo {
+            if !filter.eq_ignore_ascii_case(&repo) {
+                continue;
+            }
+        }
+        for package in database.pkgs().iter() {
+            let name = package.name().to_string();
+            let summary = package.desc().unwrap_or_default().to_string();
+            if !needle.is_empty()
+                && !name.to_ascii_lowercase().contains(&needle)
+                && !summary.to_ascii_lowercase().contains(&needle)
+            {
+                continue;
+            }
+
+            let installed_version = handle
+                .alpm
+                .localdb()
+                .pkg(name.as_str())
+                .ok()
+                .map(|local| local.version().to_string());
+            if request.installed_only && installed_version.is_none() {
+                continue;
+            }
+
+            hits.entry(name.clone()).or_insert_with(|| PackageHit {
+                name,
+                repo: repo.clone(),
+                version: package.version().to_string(),
+                installed_version,
+                download_bytes: package.size().max(0) as u64,
+                installed_bytes: package.isize().max(0) as u64,
+                summary,
+                groups: package.groups().iter().map(ToString::to_string).collect(),
+            });
+        }
+    }
+
+    let mut hits: Vec<PackageHit> = hits.into_values().collect();
+    hits.sort_by(|left, right| {
+        let left_rank = packages::search_rank(&needle, &left.name).unwrap_or(u8::MAX);
+        let right_rank = packages::search_rank(&needle, &right.name).unwrap_or(u8::MAX);
+        left_rank
+            .cmp(&right_rank)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    hits.truncate(limit);
+    Ok(hits)
+}
+
+/// Read one package from a sync database, falling back to the local database.
+pub fn details(name: &str) -> Result<PackageDetails> {
+    let handle = SystemHandle::open()?;
+    let sync = handle.alpm.syncdbs().iter().find_map(|database| {
+        database
+            .pkg(name)
+            .ok()
+            .map(|package| (database.name().to_string(), package))
+    });
+    let local = handle.alpm.localdb().pkg(name).ok();
+
+    let (repo, package, installed_version) = match sync {
+        Some((repo, package)) => (
+            Some(repo),
+            package,
+            local.map(|local| local.version().to_string()),
+        ),
+        None => match local {
+            Some(package) => (None, package, Some(package.version().to_string())),
+            None => anyhow::bail!("{name} was not found in the enabled repositories"),
+        },
+    };
+
+    let mut required_by = Vec::new();
+    if installed_version.is_some() {
+        for installed in handle.alpm.localdb().pkgs().iter() {
+            if installed.name() == name {
+                continue;
+            }
+            if installed
+                .depends()
+                .iter()
+                .any(|dependency| dependency.name() == name)
+            {
+                required_by.push(installed.name().to_string());
+            }
+        }
+        required_by.sort();
+    }
+
+    Ok(PackageDetails {
+        name: package.name().to_string(),
+        repo,
+        version: package.version().to_string(),
+        installed_version,
+        description: package.desc().unwrap_or_default().to_string(),
+        url: package.url().unwrap_or_default().to_string(),
+        packager: package.packager().unwrap_or_default().to_string(),
+        build_date: package.build_date(),
+        download_bytes: package.size().max(0) as u64,
+        installed_bytes: package.isize().max(0) as u64,
+        licenses: package.licenses().iter().map(ToString::to_string).collect(),
+        groups: package.groups().iter().map(ToString::to_string).collect(),
+        depends: package.depends().iter().map(ToString::to_string).collect(),
+        optdepends: package
+            .optdepends()
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        conflicts: package
+            .conflicts()
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        replaces: package.replaces().iter().map(ToString::to_string).collect(),
+        provides: package.provides().iter().map(ToString::to_string).collect(),
+        required_by,
+    })
+}
+
+/// Resolve a proposed install or removal with libalpm without touching the
+/// system. This is the same read-only preparation used for update holds.
+pub fn preview(request: &PackageRequest) -> Result<PackagePreview> {
+    packages::validate_names(&request.names).map_err(anyhow::Error::msg)?;
+
+    let mut handle = SystemHandle::open()?;
+    handle
+        .alpm
+        .trans_init(TransFlag::NONE)
+        .context("start the libalpm transaction")?;
+
+    let result = (|| -> Result<PackagePreview> {
+        let mut pending_system_updates = 0;
+        let mut warnings = Vec::new();
+
+        match request.action {
+            PackageAction::Install => {
+                handle
+                    .alpm
+                    .sync_sysupgrade(false)
+                    .context("compute the sysupgrade")?;
+                pending_system_updates = handle.alpm.trans_add().iter().count();
+                let pending: HashSet<String> = handle
+                    .alpm
+                    .trans_add()
+                    .iter()
+                    .map(|package| package.name().to_string())
+                    .collect();
+
+                for name in &request.names {
+                    for package in resolve_sync_targets(&handle.alpm, name)? {
+                        if let Ok(local) = handle.alpm.localdb().pkg(package.name()) {
+                            if local.version().as_str() == package.version().as_str() {
+                                continue;
+                            }
+                        }
+                        if pending.contains(package.name()) {
+                            continue;
+                        }
+                        handle
+                            .alpm
+                            .trans_add_pkg(package)
+                            .map_err(|error| anyhow!(error.to_string()))?;
+                    }
+                }
+            }
+            PackageAction::Remove => {
+                for name in &request.names {
+                    let package = handle.alpm.localdb().pkg(name.as_str()).with_context(|| {
+                        format!("{name} is not installed, so it cannot be removed")
+                    })?;
+                    handle
+                        .alpm
+                        .trans_remove_pkg(package)
+                        .map_err(|error| anyhow!(error.to_string()))?;
+                }
+            }
+        }
+
+        handle
+            .alpm
+            .trans_prepare()
+            .map_err(|error| anyhow!(error.to_string()))?;
+
+        let adds: Vec<PackagePreviewItem> = handle
+            .alpm
+            .trans_add()
+            .iter()
+            .map(|package| preview_item(&handle.alpm, package))
+            .collect();
+        let removes: Vec<PackagePreviewItem> = handle
+            .alpm
+            .trans_remove()
+            .iter()
+            .map(|package| preview_item(&handle.alpm, package))
+            .collect();
+
+        if pending_system_updates > 0 && request.action == PackageAction::Install {
+            warnings.push(format!(
+                "This transaction also applies {pending_system_updates} pending system update(s)."
+            ));
+        }
+        if !removes.is_empty() {
+            warnings.push(format!(
+                "This transaction removes: {}.",
+                removes
+                    .iter()
+                    .map(|item| item.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+
+        let removed: HashSet<&str> = removes.iter().map(|item| item.name.as_str()).collect();
+        for package in handle.alpm.trans_add().iter() {
+            for replacement in package.replaces().iter() {
+                if removed.contains(replacement.name()) {
+                    warnings.push(format!(
+                        "{} replaces {}.",
+                        package.name(),
+                        replacement.name()
+                    ));
+                }
+            }
+        }
+
+        let total_download_bytes = adds.iter().map(|item| item.download_bytes).sum();
+        let total_installed_bytes = if request.action == PackageAction::Remove {
+            removes.iter().map(|item| item.installed_bytes).sum()
+        } else {
+            adds.iter().map(|item| item.installed_bytes).sum()
+        };
+        let reboot_suggested = adds.iter().any(|item| plan::is_reboot_package(&item.name));
+
+        Ok(PackagePreview {
+            action: request.action,
+            adds,
+            removes,
+            total_download_bytes,
+            total_installed_bytes,
+            pending_system_updates,
+            reboot_suggested,
+            warnings,
+        })
+    })();
+
+    let release = handle.alpm.trans_release();
+    let preview = result?;
+    release.context("release the libalpm transaction")?;
+    Ok(preview)
+}
+
+fn resolve_sync_targets<'a>(alpm: &'a Alpm, name: &str) -> Result<Vec<&'a alpm::Package>> {
+    for database in alpm.syncdbs().iter() {
+        if let Ok(package) = database.pkg(name) {
+            return Ok(vec![package]);
+        }
+    }
+    for database in alpm.syncdbs().iter() {
+        if let Ok(group) = database.group(name) {
+            let packages: Vec<&alpm::Package> = group.packages().iter().collect();
+            if !packages.is_empty() {
+                return Ok(packages);
+            }
+        }
+    }
+    anyhow::bail!("{name} was not found in the enabled repositories")
+}
+
+fn preview_item(alpm: &Alpm, package: &alpm::Package) -> PackagePreviewItem {
+    let current_version = alpm
+        .localdb()
+        .pkg(package.name())
+        .ok()
+        .map(|local| local.version().to_string());
+    PackagePreviewItem {
+        name: package.name().to_string(),
+        repo: package.db().map(|database| database.name().to_string()),
+        version: package.version().to_string(),
+        current_version,
+        download_bytes: package.size().max(0) as u64,
+        installed_bytes: package.isize().max(0) as u64,
+    }
+}
+
+/// The exact pacman arguments for a package transaction. Kept separate so the
+/// partial-upgrade rule is testable without touching a database.
+fn package_args(action: PackageAction, names: &[String]) -> Vec<String> {
+    let mut args: Vec<String> = match action {
+        PackageAction::Install => ["-Syu", "--needed", "--noconfirm", "--color", "never"]
+            .into_iter()
+            .map(ToString::to_string)
+            .collect(),
+        PackageAction::Remove => ["-Rns", "--noconfirm"]
+            .into_iter()
+            .map(ToString::to_string)
+            .collect(),
+    };
+    args.extend(names.iter().cloned());
+    args
+}
+
+/// Apply one install or removal transaction.
+pub async fn apply_packages(
+    request: &PackageRequest,
+    events: mpsc::Sender<ApplyEvent>,
+    cancel: CancelHandle,
+) -> Result<PackageOutcome> {
+    packages::validate_names(&request.names).map_err(anyhow::Error::msg)?;
+    // Validate the full transaction before pacman starts. The UI previews the
+    // same result; this protects direct D-Bus callers.
+    let preview = preview(request)?;
+
+    let names = request.names.clone();
+    let mut command = tokio::process::Command::new("pacman");
+    let args = package_args(request.action, &names);
+    let label = match request.action {
+        PackageAction::Install => format!("pacman -Syu --needed {}", names.join(" ")),
+        PackageAction::Remove => format!("pacman -Rns {}", names.join(" ")),
+    };
+    command
+        .args(&args)
+        .env("LC_ALL", "C")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let reboot_suggested = preview.reboot_suggested;
+
+    let outcome = run_child(command, &label, 0, pacman_progress, events, cancel).await?;
+
+    Ok(PackageOutcome {
+        success: outcome.success,
+        cancelled: outcome.cancelled,
+        action: request.action,
+        names,
+        reboot_suggested,
+        log_tail: outcome.log,
+        error: outcome.error,
+    })
+}
+
+/// Effective repository state, including which file defines each repository.
+pub fn repository_status() -> Result<RepositoryStatus> {
+    let view = pacman_config::inspect(Path::new(ROOT))?;
+    let handle = SystemHandle::open()?;
+    let mut entries = view.repositories.clone();
+    if view.multilib().is_none() {
+        entries.push(pacman_config::RepoEntry {
+            name: "multilib".to_string(),
+            enabled: false,
+            source_file: view
+                .commented_multilib_source
+                .clone()
+                .unwrap_or_else(|| view.main_file.clone()),
+            line: 0,
+        });
+    }
+
+    let mut repositories = Vec::new();
+    for entry in entries {
+        let database = handle
+            .alpm
+            .syncdbs()
+            .iter()
+            .find(|database| database.name() == entry.name);
+        let package_count = database.map(|database| database.pkgs().len()).unwrap_or(0);
+        let synced_at = fs::metadata(sync_database(&entry.name))
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .map(format_time);
+
+        let managed_by_include = entry.source_file != view.main_file;
+        let toggleable = entry.name == "multilib"
+            && if entry.enabled {
+                !managed_by_include
+            } else {
+                !managed_by_include || entry.source_file == view.main_file
+            };
+        let note = if entry.name == "multilib" {
+            if entry.enabled && managed_by_include {
+                Some(format!("Enabled by {}.", entry.source_file.display()))
+            } else {
+                None
+            }
+        } else if matches!(
+            entry.name.as_str(),
+            "core" | "extra" | "veldmuis-core" | "veldmuis-extra"
+        ) {
+            Some("Required repository.".to_string())
+        } else {
+            None
+        };
+
+        repositories.push(RepositoryInfo {
+            name: entry.name,
+            enabled: entry.enabled,
+            source_file: entry.source_file.display().to_string(),
+            note,
+            toggleable,
+            package_count,
+            synced_at,
+        });
+    }
+
+    let parallel_downloads_editable = view
+        .parallel_downloads_source
+        .as_deref()
+        .map(|source| source == view.main_file.as_path())
+        .unwrap_or(true);
+
+    Ok(RepositoryStatus {
+        pacman_conf: view.main_file.display().to_string(),
+        repositories,
+        warnings: view.warnings,
+        parallel_downloads: view.parallel_downloads.unwrap_or(5),
+        parallel_downloads_editable,
+        parallel_downloads_source: view
+            .parallel_downloads_source
+            .map(|path| path.display().to_string()),
+    })
+}
+
+/// Enable or disable multilib. Only `/etc/pacman.conf` is ever rewritten.
+pub fn set_repository(name: &str, enabled: bool) -> Result<RepositoryStatus> {
+    if name != "multilib" {
+        anyhow::bail!("Only the multilib repository can be changed from Skemer");
+    }
+    let view = pacman_config::inspect(Path::new(ROOT))?;
+    if view.pacnew {
+        anyhow::bail!(
+            "{} has a .pacnew file. Resolve the configuration changes before changing repositories.",
+            view.main_file.display()
+        );
+    }
+
+    let current = view.multilib();
+    if enabled && current.is_some_and(|entry| entry.enabled) {
+        return repository_status();
+    }
+    if !enabled && current.is_none() {
+        return repository_status();
+    }
+    if !enabled {
+        let entry = current.expect("checked above");
+        if entry.source_file != view.main_file {
+            anyhow::bail!(
+                "multilib is managed by {} and cannot be disabled here",
+                entry.source_file.display()
+            );
+        }
+    }
+
+    let original = fs::read_to_string(&view.main_file)
+        .with_context(|| format!("read {}", view.main_file.display()))?;
+    let updated = if enabled {
+        pacman_config::enable_multilib_text(&original).map_err(anyhow::Error::msg)?
+    } else {
+        pacman_config::disable_multilib_text(&original).map_err(anyhow::Error::msg)?
+    };
+    if updated == original {
+        return repository_status();
+    }
+
+    let backup = write_config_atomic(&view.main_file, &updated)?;
+    if let Err(error) = sync_databases() {
+        let _ = fs::copy(&backup, &view.main_file);
+        return Err(error);
+    }
+    repository_status()
+}
+
+/// Set ParallelDownloads. Other pacman options stay a terminal concern.
+pub fn set_parallel_downloads(value: u32) -> Result<RepositoryStatus> {
+    if !(1..=10).contains(&value) {
+        anyhow::bail!("Parallel downloads must be between 1 and 10");
+    }
+    let view = pacman_config::inspect(Path::new(ROOT))?;
+    if view.pacnew {
+        anyhow::bail!(
+            "{} has a .pacnew file. Resolve the configuration changes before changing settings.",
+            view.main_file.display()
+        );
+    }
+    if let Some(source) = &view.parallel_downloads_source {
+        if source != &view.main_file {
+            anyhow::bail!(
+                "ParallelDownloads is set by {} and cannot be changed here",
+                source.display()
+            );
+        }
+    }
+
+    let original = fs::read_to_string(&view.main_file)
+        .with_context(|| format!("read {}", view.main_file.display()))?;
+    let updated =
+        pacman_config::set_parallel_downloads_text(&original, value).map_err(anyhow::Error::msg)?;
+    if updated == original {
+        return repository_status();
+    }
+
+    write_config_atomic(&view.main_file, &updated)?;
+    repository_status()
+}
+
+const SKEMER_STATE_DIR: &str = "/var/lib/skemer";
+
+fn write_config_atomic(path: &Path, text: &str) -> Result<PathBuf> {
+    let metadata =
+        fs::metadata(path).with_context(|| format!("read metadata for {}", path.display()))?;
+    let backup_dir = Path::new(SKEMER_STATE_DIR).join("backups");
+    fs::create_dir_all(&backup_dir).with_context(|| format!("create {}", backup_dir.display()))?;
+    let backup = backup_dir.join(format!(
+        "pacman.conf.{}",
+        chrono::Utc::now().timestamp_millis()
+    ));
+    fs::copy(path, &backup)
+        .with_context(|| format!("back up {} to {}", path.display(), backup.display()))?;
+
+    let temporary = path.with_file_name(format!(".pacman.conf.skemer-{}", std::process::id()));
+    {
+        let mut file = fs::File::create(&temporary)
+            .with_context(|| format!("create {}", temporary.display()))?;
+        file.write_all(text.as_bytes())
+            .with_context(|| format!("write {}", temporary.display()))?;
+        file.sync_all().ok();
+    }
+    fs::set_permissions(&temporary, metadata.permissions()).ok();
+    if let Err(error) = validate_config(&temporary) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    fs::rename(&temporary, path).with_context(|| format!("replace {}", path.display()))?;
+    Ok(backup)
+}
+
+fn validate_config(path: &Path) -> Result<()> {
+    let output = StdCommand::new("pacman-conf")
+        .arg("--config")
+        .arg(path)
+        .output()
+        .context("run pacman-conf")?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "pacman rejected the new configuration: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+    }
+}
+
+fn sync_databases() -> Result<()> {
+    let output = StdCommand::new("pacman")
+        .arg("-Sy")
+        .arg("--noconfirm")
+        .env("LC_ALL", "C")
+        .output()
+        .context("run pacman -Sy")?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "the repository databases could not be synced: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+    }
+}
+
+fn format_time(time: std::time::SystemTime) -> String {
+    let time: chrono::DateTime<chrono::Local> = time.into();
+    time.format("%Y-%m-%d %H:%M").to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
+
+    #[test]
+    #[ignore = "reads the host pacman configuration"]
+    fn reports_host_repositories() {
+        let status = repository_status().expect("host repositories");
+        assert!(status.repositories.iter().any(|repo| repo.name == "core"));
+        assert!(status.parallel_downloads >= 1);
+        eprintln!(
+            "{} repositories, parallel downloads {}, multilib {:?}",
+            status.repositories.len(),
+            status.parallel_downloads,
+            status
+                .repositories
+                .iter()
+                .find(|repo| repo.name == "multilib")
+        );
+    }
+
+    #[test]
+    #[ignore = "reads the host pacman databases"]
+    fn searches_the_host_packages() {
+        let hits = search(&PackageQuery {
+            query: "steam".to_string(),
+            ..PackageQuery::default()
+        })
+        .expect("host search");
+        assert!(hits.iter().any(|hit| hit.name == "steam"));
+
+        let details = details("steam").expect("host details");
+        assert_eq!(details.name, "steam");
+        assert!(!details.version.is_empty());
+
+        if is_root() {
+            let preview = preview(&PackageRequest {
+                action: PackageAction::Install,
+                names: vec!["steam".to_string()],
+            })
+            .expect("host preview");
+            assert_eq!(preview.action, PackageAction::Install);
+        }
+    }
+
+    #[test]
+    fn install_command_folds_a_full_sync_in() {
+        let names = vec!["steam".to_string(), "openai-codex".to_string()];
+        let args = package_args(PackageAction::Install, &names);
+        assert_eq!(
+            args.iter().map(String::as_str).collect::<Vec<_>>(),
+            vec![
+                "-Syu",
+                "--needed",
+                "--noconfirm",
+                "--color",
+                "never",
+                "steam",
+                "openai-codex"
+            ]
+        );
+        assert!(!args.iter().any(|argument| argument == "-S"));
+    }
+
+    #[test]
+    fn remove_command_uses_the_removal_closure_flags() {
+        let names = vec!["steam".to_string()];
+        let args = package_args(PackageAction::Remove, &names);
+        assert_eq!(
+            args.iter().map(String::as_str).collect::<Vec<_>>(),
+            vec!["-Rns", "--noconfirm", "steam"]
+        );
+    }
 
     #[test]
     fn holds_are_trimmed_sorted_and_deduplicated() {

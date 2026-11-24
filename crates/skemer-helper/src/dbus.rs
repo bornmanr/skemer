@@ -1,7 +1,9 @@
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use skemer_core::models::{ApplyOutcome, ApplyRequest, UpdateSource};
+use skemer_core::models::{
+    ApplyOutcome, ApplyRequest, PackageOutcome, PackageQuery, PackageRequest, UpdateSource,
+};
 use skemer_core::CancelHandle;
 use tokio::sync::mpsc;
 use zbus::message::Header;
@@ -181,6 +183,184 @@ impl SkemerService {
         };
 
         serde_json::to_string(&outcome).map_err(failed)
+    }
+
+    /// Search the enabled official repositories. Read-only.
+    async fn search_packages(&self, request: String) -> Result<String, fdo::Error> {
+        let request: PackageQuery = serde_json::from_str(&request)
+            .map_err(|error| fdo::Error::InvalidArgs(error.to_string()))?;
+        let hits = tokio::task::spawn_blocking(move || system::search(&request))
+            .await
+            .map_err(failed)?
+            .map_err(failed)?;
+        serde_json::to_string(&hits).map_err(failed)
+    }
+
+    /// Full metadata for one package. Read-only.
+    async fn package_info(&self, name: String) -> Result<String, fdo::Error> {
+        let details = tokio::task::spawn_blocking(move || system::details(&name))
+            .await
+            .map_err(failed)?
+            .map_err(failed)?;
+        serde_json::to_string(&details).map_err(failed)
+    }
+
+    /// Resolve an install or removal without changing anything. Read-only, but
+    /// serialized with updates so it cannot race a transaction.
+    async fn preview_packages(&self, request: String) -> Result<String, fdo::Error> {
+        let request: PackageRequest = serde_json::from_str(&request)
+            .map_err(|error| fdo::Error::InvalidArgs(error.to_string()))?;
+        let _guard = self.transaction_lock.lock().await;
+        let preview = tokio::task::spawn_blocking(move || system::preview(&request))
+            .await
+            .map_err(failed)?
+            .map_err(failed)?;
+        serde_json::to_string(&preview).map_err(failed)
+    }
+
+    /// Install or remove packages. Requires polkit authorization and shares the
+    /// single transaction lock with updates. Progress and log lines are emitted
+    /// as the same signals used by Apply.
+    async fn apply_packages(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+        request: String,
+    ) -> Result<String, fdo::Error> {
+        let request: PackageRequest = serde_json::from_str(&request)
+            .map_err(|error| fdo::Error::InvalidArgs(error.to_string()))?;
+        let sender = header
+            .sender()
+            .map(ToString::to_string)
+            .ok_or_else(|| fdo::Error::Failed("missing D-Bus sender".to_string()))?;
+
+        polkit::authorize(connection, &sender, polkit::MANAGE_PACKAGES_ACTION)
+            .await
+            .map_err(failed)?;
+        let uid = connection_uid(connection, &sender).await.map_err(failed)?;
+
+        let cancel = CancelHandle::default();
+        {
+            let mut running = self
+                .running
+                .lock()
+                .map_err(|_| fdo::Error::Failed("the update lock is poisoned".to_string()))?;
+            if running.is_some() {
+                return Err(fdo::Error::Failed(
+                    "an update is already running".to_string(),
+                ));
+            }
+            *running = Some(RunningJob {
+                cancel: cancel.clone(),
+                uid,
+            });
+        }
+        let _running_guard = RunningGuard {
+            running: self.running.clone(),
+        };
+
+        let _guard = self.transaction_lock.lock().await;
+
+        let (events_tx, mut events_rx) = mpsc::channel::<system::ApplyEvent>(256);
+        let emitter = emitter.to_owned();
+        let forwarder = tokio::spawn(async move {
+            while let Some(event) = events_rx.recv().await {
+                match event {
+                    system::ApplyEvent::Progress { percent, message } => {
+                        let _ = SkemerService::progress(emitter.clone(), percent, message).await;
+                    }
+                    system::ApplyEvent::Log(line) => {
+                        let _ = SkemerService::log_line(emitter.clone(), line).await;
+                    }
+                }
+            }
+        });
+
+        let result = system::apply_packages(&request, events_tx, cancel).await;
+        let _ = forwarder.await;
+
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(error) => PackageOutcome {
+                success: false,
+                cancelled: false,
+                action: request.action,
+                names: request.names.clone(),
+                reboot_suggested: false,
+                log_tail: String::new(),
+                error: Some(error.to_string()),
+            },
+        };
+
+        serde_json::to_string(&outcome).map_err(failed)
+    }
+
+    /// Effective repository and pacman option state. Read-only.
+    async fn repository_status(&self) -> Result<String, fdo::Error> {
+        let status = tokio::task::spawn_blocking(system::repository_status)
+            .await
+            .map_err(failed)?
+            .map_err(failed)?;
+        serde_json::to_string(&status).map_err(failed)
+    }
+
+    /// Enable or disable multilib. Requires polkit authorization.
+    async fn set_repository(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
+        name: String,
+        enabled: bool,
+    ) -> Result<String, fdo::Error> {
+        let sender = header
+            .sender()
+            .map(ToString::to_string)
+            .ok_or_else(|| fdo::Error::Failed("missing D-Bus sender".to_string()))?;
+        polkit::authorize(connection, &sender, polkit::MANAGE_REPOSITORIES_ACTION)
+            .await
+            .map_err(failed)?;
+
+        let _guard = self.transaction_lock.lock().await;
+        let status = tokio::task::spawn_blocking(move || system::set_repository(&name, enabled))
+            .await
+            .map_err(failed)?
+            .map_err(failed)?;
+        serde_json::to_string(&status).map_err(failed)
+    }
+
+    /// Set an allowlisted pacman option. Requires polkit authorization.
+    async fn set_pacman_option(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
+        name: String,
+        value: String,
+    ) -> Result<String, fdo::Error> {
+        let sender = header
+            .sender()
+            .map(ToString::to_string)
+            .ok_or_else(|| fdo::Error::Failed("missing D-Bus sender".to_string()))?;
+        polkit::authorize(connection, &sender, polkit::MANAGE_REPOSITORIES_ACTION)
+            .await
+            .map_err(failed)?;
+
+        let option = name.to_ascii_lowercase();
+        if option != "paralleldownloads" && option != "parallel-downloads" {
+            return Err(fdo::Error::InvalidArgs(format!(
+                "the option {name} cannot be changed from Skemer"
+            )));
+        }
+        let value: u32 = value.parse().map_err(|_| {
+            fdo::Error::InvalidArgs("ParallelDownloads must be a number".to_string())
+        })?;
+
+        let _guard = self.transaction_lock.lock().await;
+        let status = tokio::task::spawn_blocking(move || system::set_parallel_downloads(value))
+            .await
+            .map_err(failed)?
+            .map_err(failed)?;
+        serde_json::to_string(&status).map_err(failed)
     }
 
     /// Cancel the running transaction. Only the user that started the update
