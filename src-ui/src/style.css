@@ -550,6 +550,12 @@ input {
   color: #b9e2b9;
 }
 
+.banner.warning {
+  border-color: #6b5320;
+  background: #33250f;
+  color: #f3d58a;
+}
+
 .progress-panel {
   flex: 1;
   min-height: 0;
