@@ -562,6 +562,9 @@ function render(): void {
 
       ${state.error ? `<div class="banner error">${escapeHtml(state.error)}</div>` : ""}
       ${state.notice ? `<div class="banner success">${escapeHtml(state.notice)}</div>` : ""}
+      ${(state.plan?.warnings ?? [])
+        .map((warning) => `<div class="banner warning">${escapeHtml(warning)}</div>`)
+        .join("")}
 
       ${state.applying ? "" : browse ? browseView() : updatesView(selected, total, reboot, detail)}
 

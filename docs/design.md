@@ -41,6 +41,9 @@ package management.
 
 - **libalpm** (official `alpm` crate 5.x) for metadata, plans, transaction
   preparation, conflict detection, and hold validation.
+- **`pacman -Sy`** before each check, so the plan uses current sync databases
+  the way `pacman -Syu` does. Refreshes are coalesced for 60 seconds; a failed
+  refresh is a warning and the cached databases are used.
 - **`pacman -Syu`** for the actual apply, so pacman hooks and transaction
   behavior are exactly pacman’s.
 - System updates are atomic. No per-package official updates.
@@ -88,7 +91,8 @@ skemer --tray (user)
 - The GUI never runs as root.
 - The helper exposes fixed methods only. No command strings, no arbitrary
   paths, no shell interpolation.
-- `Check` is allowed for active local users; it is read-only.
+- `Check` is allowed for active local users. It refreshes the sync databases
+  (metadata only) and is otherwise read-only.
 - `Prepare` validates holds with libalpm; it is read-only.
 - `Apply` requires polkit `auth_admin_keep`.
 - `RefreshMirrors` requires polkit `auth_admin_keep`.

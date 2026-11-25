@@ -3,6 +3,8 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Stdio};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use alpm::{Alpm, SigLevel, TransFlag};
 use anyhow::{anyhow, Context, Result};
@@ -21,8 +23,22 @@ const DB_PATH: &str = "/var/lib/pacman";
 const SYNC_PATH: &str = "/var/lib/pacman/sync";
 const PACMAN_CONF: &str = "/etc/pacman.conf";
 
+/// Sync databases are metadata, not a transaction. Coalesce rapid checks so a
+/// local user cannot turn every check into a mirror download.
+const DATABASE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+static LAST_DATABASE_REFRESH: Mutex<Option<Instant>> = Mutex::new(None);
+
 /// Read the pending system update plan from the pacman databases.
+///
+/// `pacman -Syu` refreshes the sync databases before it plans an upgrade.
+/// Checking only the cached databases misses updates until something else runs
+/// `-Sy`, so refresh first and fall back to the cache when the refresh fails.
 pub fn check() -> Result<UpdatePlan> {
+    let mut warnings = Vec::new();
+    if let Err(error) = refresh_databases_if_due() {
+        warnings.push(format!("Could not refresh the package databases: {error}"));
+    }
+
     let mut handle = SystemHandle::open()?;
     let items = handle.update_items();
     let items = match items {
@@ -40,10 +56,55 @@ pub fn check() -> Result<UpdatePlan> {
     };
 
     let reboot_suggested = plan::reboot_suggested_now(&items);
+    warnings.append(&mut handle.warnings);
     let mut plan = UpdatePlan::from_items(items, now());
     plan.reboot_suggested = reboot_suggested;
-    plan.warnings = handle.warnings;
+    plan.warnings = warnings;
     Ok(plan)
+}
+
+fn refresh_databases_if_due() -> Result<()> {
+    let now = Instant::now();
+    {
+        let last = LAST_DATABASE_REFRESH
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !refresh_due(*last, now) {
+            return Ok(());
+        }
+    }
+
+    refresh_databases_with("pacman")?;
+
+    let mut last = LAST_DATABASE_REFRESH
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *last = Some(now);
+    Ok(())
+}
+
+fn refresh_due(last: Option<Instant>, now: Instant) -> bool {
+    last.map(|last| now.saturating_duration_since(last) >= DATABASE_REFRESH_INTERVAL)
+        .unwrap_or(true)
+}
+
+fn refresh_databases_with(pacman: &str) -> Result<()> {
+    let output = StdCommand::new(pacman)
+        .args(["-Sy", "--noconfirm", "--color", "never"])
+        .env("LC_ALL", "C")
+        .output()
+        .with_context(|| format!("run {pacman} -Sy"))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr.trim();
+    if stderr.is_empty() {
+        anyhow::bail!("{pacman} -Sy exited with {}", output.status);
+    }
+    anyhow::bail!("{stderr}");
 }
 
 /// Validate a proposed hold set with libalpm. A hold is only offered when the
@@ -776,7 +837,12 @@ pub fn preview(request: &PackageRequest) -> Result<PackagePreview> {
     handle
         .alpm
         .trans_init(TransFlag::NONE)
-        .context("start the libalpm transaction")?;
+        .map_err(|error| match error {
+            alpm::Error::HandleLock => anyhow!(
+                "Another package manager is using the pacman database. Try again when it finishes."
+            ),
+            other => anyhow!(other).context("start the libalpm transaction"),
+        })?;
 
     let result = (|| -> Result<PackagePreview> {
         let mut pending_system_updates = 0;
@@ -829,7 +895,7 @@ pub fn preview(request: &PackageRequest) -> Result<PackagePreview> {
         handle
             .alpm
             .trans_prepare()
-            .map_err(|error| anyhow!(error.to_string()))?;
+            .map_err(|error| anyhow!(prepare_error_message(&error)))?;
 
         let adds: Vec<PackagePreviewItem> = handle
             .alpm
@@ -897,6 +963,64 @@ pub fn preview(request: &PackageRequest) -> Result<PackagePreview> {
     let preview = result?;
     release.context("release the libalpm transaction")?;
     Ok(preview)
+}
+
+/// Turn libalpm's prepare failure into something the user can act on. The
+/// error kind alone ("could not satisfy dependencies") does not say which
+/// package blocks a removal.
+fn prepare_error_message(error: &alpm::PrepareError<'_>) -> String {
+    let base = error.error().to_string();
+    match error.data() {
+        Some(alpm::PrepareData::UnsatisfiedDeps(missing)) => {
+            let details: Vec<String> = missing
+                .iter()
+                .map(|item| {
+                    let dependency = item.depend().to_string();
+                    match item.causing_pkg() {
+                        Some(causing) => format!(
+                            "{} requires {}, but {} would be removed",
+                            item.target(),
+                            dependency,
+                            causing
+                        ),
+                        None => format!("{} requires {}", item.target(), dependency),
+                    }
+                })
+                .collect();
+            if details.is_empty() {
+                base
+            } else {
+                format!("{base}: {}", details.join("; "))
+            }
+        }
+        Some(alpm::PrepareData::ConflictingDeps(conflicts)) => {
+            let details: Vec<String> = conflicts
+                .iter()
+                .map(|conflict| {
+                    format!(
+                        "{} conflicts with {} ({})",
+                        conflict.package1().name(),
+                        conflict.package2().name(),
+                        conflict.reason()
+                    )
+                })
+                .collect();
+            if details.is_empty() {
+                base
+            } else {
+                format!("{base}: {}", details.join("; "))
+            }
+        }
+        Some(alpm::PrepareData::PkgInvalidArch(packages)) => {
+            let names: Vec<&str> = packages.iter().map(|package| package.name()).collect();
+            if names.is_empty() {
+                base
+            } else {
+                format!("{base}: {}", names.join(", "))
+            }
+        }
+        None => base,
+    }
 }
 
 fn resolve_sync_targets<'a>(alpm: &'a Alpm, name: &str) -> Result<Vec<&'a alpm::Package>> {
@@ -1265,6 +1389,54 @@ mod tests {
             .expect("host preview");
             assert_eq!(preview.action, PackageAction::Install);
         }
+    }
+
+    #[test]
+    fn database_refresh_is_coalesced() {
+        let now = Instant::now();
+        assert!(refresh_due(None, now));
+        assert!(!refresh_due(Some(now), now));
+        assert!(!refresh_due(
+            Some(now.checked_sub(Duration::from_secs(30)).expect("past")),
+            now
+        ));
+        assert!(refresh_due(
+            Some(now.checked_sub(Duration::from_secs(61)).expect("past")),
+            now
+        ));
+    }
+
+    #[test]
+    fn database_refresh_uses_sync_only() {
+        let marker =
+            std::env::temp_dir().join(format!("skemer-refresh-args-{}", std::process::id()));
+        let script = fake_program(
+            "pacman-refresh",
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n",
+                marker.display()
+            ),
+        );
+
+        refresh_databases_with(script.to_str().expect("script path")).expect("refresh");
+        let args = fs::read_to_string(&marker).expect("args");
+        assert_eq!(
+            args.lines().collect::<Vec<_>>(),
+            vec!["-Sy", "--noconfirm", "--color", "never"]
+        );
+        fs::remove_file(&marker).ok();
+    }
+
+    #[test]
+    fn database_refresh_reports_pacman_errors() {
+        let script = fake_program(
+            "pacman-refresh-fail",
+            "#!/bin/sh\necho 'error: failed retrieving file' >&2\nexit 1\n",
+        );
+
+        let error = refresh_databases_with(script.to_str().expect("script path"))
+            .expect_err("refresh failure");
+        assert!(error.to_string().contains("failed retrieving file"));
     }
 
     #[test]
