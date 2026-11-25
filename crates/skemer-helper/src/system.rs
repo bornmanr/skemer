@@ -325,13 +325,14 @@ async fn apply_system(
         })
         .await;
 
+    let error = plan::command_error(outcome.error, &outcome.log);
     Ok(ApplyOutcome {
         success: outcome.success,
         cancelled: outcome.cancelled,
         held_packages: holds,
         reboot_suggested,
         log_tail: outcome.log,
-        error: outcome.error,
+        error,
         candidates,
     })
 }
@@ -1101,6 +1102,7 @@ pub async fn apply_packages(
 
     let outcome = run_child(command, &label, 0, pacman_progress, events, cancel).await?;
 
+    let error = plan::command_error(outcome.error, &outcome.log);
     Ok(PackageOutcome {
         success: outcome.success,
         cancelled: outcome.cancelled,
@@ -1108,7 +1110,7 @@ pub async fn apply_packages(
         names,
         reboot_suggested,
         log_tail: outcome.log,
-        error: outcome.error,
+        error,
     })
 }
 

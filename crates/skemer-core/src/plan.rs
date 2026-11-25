@@ -58,6 +58,57 @@ pub fn hold_candidates_from_error(error: &str) -> Vec<String> {
     candidates
 }
 
+/// Explain pacman's file-conflict failure. An unowned file usually means the
+/// same tool was installed by npm, pip, or a manual download, which pacman
+/// refuses to overwrite.
+pub fn file_conflict_message(log: &str) -> Option<String> {
+    let mut conflicts: Vec<String> = Vec::new();
+
+    for line in log.lines() {
+        let Some((package, rest)) = line.split_once(": ") else {
+            continue;
+        };
+        let Some(index) = rest.find(" exists in filesystem") else {
+            continue;
+        };
+        let path = rest[..index].trim();
+        let tail = rest[index + " exists in filesystem".len()..].trim();
+        let owner = tail
+            .strip_prefix("(owned by ")
+            .and_then(|value| value.strip_suffix(')'));
+
+        let message = match owner {
+            Some(owner) => {
+                format!("{package} cannot install because {path} is owned by {owner}")
+            }
+            None => format!(
+                "{package} cannot install because {path} is not owned by any package. \
+                 It may have been installed by npm, pip, or another tool; remove that installation first"
+            ),
+        };
+        if !conflicts.contains(&message) {
+            conflicts.push(message);
+        }
+    }
+
+    if conflicts.is_empty() {
+        None
+    } else {
+        Some(format!("{}.", conflicts.join("; ")))
+    }
+}
+
+/// Combine pacman's own failure with the actionable file-conflict hint.
+pub fn command_error(error: Option<String>, log: &str) -> Option<String> {
+    match file_conflict_message(log) {
+        Some(hint) => Some(match error {
+            Some(base) => format!("{base}. {hint}"),
+            None => hint,
+        }),
+        None => error,
+    }
+}
+
 fn is_package_name(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
@@ -184,6 +235,45 @@ mod tests {
     #[test]
     fn empty_error_has_no_candidates() {
         assert!(hold_candidates_from_error("").is_empty());
+    }
+
+    #[test]
+    fn explains_unowned_file_conflicts() {
+        let log = "\
+            error: failed to commit transaction (conflicting files)\n\
+            openai-codex: /usr/bin/codex exists in filesystem\n\
+            Errors occurred, no packages were upgraded.\n";
+        let message = file_conflict_message(log).expect("file conflict");
+        assert!(message.contains("openai-codex"));
+        assert!(message.contains("/usr/bin/codex"));
+        assert!(message.contains("not owned by any package"));
+        assert!(message.contains("npm"));
+    }
+
+    #[test]
+    fn explains_owned_file_conflicts() {
+        let log = "foo: /usr/bin/tool exists in filesystem (owned by bar)\n";
+        let message = file_conflict_message(log).expect("file conflict");
+        assert!(message.contains("/usr/bin/tool is owned by bar"));
+    }
+
+    #[test]
+    fn unrelated_pacman_failures_have_no_file_conflict_hint() {
+        let log = "error: failed to commit transaction (invalid or corrupted package)\n";
+        assert!(file_conflict_message(log).is_none());
+        assert_eq!(
+            command_error(Some("base error".to_string()), log),
+            Some("base error".to_string())
+        );
+    }
+
+    #[test]
+    fn command_error_appends_the_file_conflict_hint() {
+        let log = "pkg: /usr/bin/tool exists in filesystem\n";
+        let error = command_error(Some("error: failed to commit transaction".to_string()), log)
+            .expect("error");
+        assert!(error.starts_with("error: failed to commit transaction."));
+        assert!(error.contains("/usr/bin/tool"));
     }
 
     #[test]
